@@ -3,6 +3,7 @@ package election
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/rand"
 	"sync"
 	"time"
@@ -169,6 +170,22 @@ func (e *node) ReceiveRPC(req RPCRequest, resp *RPCResponse) {
 func (e *node) SetPeers(peers []string) error {
 	e.lock.Lock()
 	defer e.lock.Unlock()
+
+	if len(peers) == 0 {
+		return nil
+	}
+
+	var includesSelf bool
+	for _, p := range peers {
+		if p == e.conf.Name {
+			includesSelf = true
+		}
+	}
+
+	if !includesSelf {
+		return fmt.Errorf("refusing to set peer list that does not include self '%s'", e.conf.Name)
+	}
+
 	e.peers = peers
 	return nil
 }
@@ -323,8 +340,10 @@ func (e *node) runCandidate() {
 			voteCh = e.electSelf()
 			voteTimer.Stop()
 		case rpc := <-e.rpcCh:
+			fmt.Printf("RPC: %#v\n", rpc)
 			e.processRPC(rpc)
 		case vote := <-voteCh:
+			fmt.Printf("Vote: %#v\n", vote)
 			// Check if the term is greater than ours, bail
 			if vote.Term > e.currentTerm {
 				e.log.Debug("newer term discovered, fallback to follower")
@@ -352,6 +371,7 @@ func (e *node) runCandidate() {
 			electionTimer.Stop()
 			return
 		case <-e.shutdownCh:
+			fmt.Printf("Shutdown\n")
 			return
 		}
 	}
@@ -363,7 +383,7 @@ func (e *node) runCandidate() {
 // vote for ourself.
 func (e *node) electSelf() <-chan VoteResp {
 	peers := e.GetPeers()
-	respCh := make(chan VoteResp, len(peers))
+	respCh := make(chan VoteResp, len(peers)+1)
 
 	// Increment the term
 	e.currentTerm++
@@ -408,6 +428,7 @@ func (e *node) electSelf() <-chan VoteResp {
 	e.vote.LastTerm = e.currentTerm
 
 	// Include our own vote
+	fmt.Printf("Include vote for self\n")
 	respCh <- VoteResp{
 		Candidate: e.self,
 		Term:      e.currentTerm,
@@ -421,6 +442,7 @@ func (e *node) electSelf() <-chan VoteResp {
 		}
 		askPeer(peer, e.currentTerm, e.self)
 	}
+	fmt.Printf("return\n")
 	return respCh
 }
 
@@ -469,9 +491,9 @@ func (e *node) runLeader() {
 				contacted++
 			}
 
-			// Verify we can contact a quorum
+			// Verify we can contact a quorum (Minus ourself)
 			quorum := e.quorumSize()
-			if contacted < quorum {
+			if contacted < (quorum - 1) {
 				e.log.Debug("failed to receive heart beats from a quorum of peers; stepping down")
 				e.state = FollowerState
 				// TODO: Perhaps we send ResetElection to what peers we can?

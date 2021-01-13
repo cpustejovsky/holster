@@ -5,9 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/mailgun/holster/v3/election"
 	"github.com/pkg/errors"
@@ -62,31 +63,64 @@ func newHandler(node election.Node) func(w http.ResponseWriter, r *http.Request)
 }
 
 func main() {
-	address := os.Args[0]
-	if address == "" {
-		log.Fatal("please provide an address IE: 'localhost:8080'")
+	if len(os.Args) != 4 {
+		logrus.Fatal("usage: <election-address:8080> <memberlist-address:8180> <known-address:8180>")
 	}
 
+	electionAddr, memberListAddr, knownAddr := os.Args[1], os.Args[2], os.Args[3]
 	logrus.SetLevel(logrus.DebugLevel)
+	fmt.Printf("%s - %s - %s\n", electionAddr, memberListAddr, knownAddr)
 
-	node1, err := election.SpawnNode(election.Config{
-		// A list of known peers at startup
-		Peers: []string{"localhost:7080", "localhost:7081"},
+	node, err := election.SpawnNode(election.Config{
 		// A unique identifier used to identify us in a list of peers
-		Name: "localhost:7080",
+		Name: electionAddr,
 		// Called whenever the library detects a change in leadership
 		Observer: func(leader string) {
-			log.Printf("Current Leader: %s\n", leader)
+			logrus.Printf("Current Leader: %s\n", leader)
 		},
 		// Called when the library wants to contact other peers
 		SendRPC: sendRPC,
 	})
 	if err != nil {
-		log.Fatal(err)
+		logrus.Fatal(err)
 	}
-	defer node1.Close()
+
+	// Create a member list pool
+	pool, err := election.NewMemberListPool(context.Background(), election.MemberListPoolConfig{
+		BindAddress: memberListAddr,
+		PeerInfo: election.PeerInfo{
+			HTTPAddress: electionAddr,
+		},
+		KnownNodes: []string{knownAddr},
+		OnUpdate: func(peers []election.PeerInfo) {
+			var result []string
+			for _, p := range peers {
+				result = append(result, p.HTTPAddress)
+			}
+			logrus.Infof("Update Peers: %s", result)
+			if err := node.SetPeers(result); err != nil {
+				logrus.Fatal(err)
+			}
+		},
+	})
+	if err != nil {
+		logrus.Fatal(err)
+	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/rpc", newHandler(node1))
-	log.Fatal(http.ListenAndServe(":7080", mux))
+	mux.HandleFunc("/rpc", newHandler(node))
+	go func() {
+		logrus.Fatal(http.ListenAndServe(electionAddr, mux))
+	}()
+
+	// Wait here for signals to clean up our mess
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	for range c {
+		logrus.Info("pool close")
+		pool.Close()
+		logrus.Info("node close")
+		node.Close()
+		os.Exit(0)
+	}
 }
